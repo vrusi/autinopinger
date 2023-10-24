@@ -11,8 +11,8 @@ const axios = require("axios");
 const { onRequest } = require("firebase-functions/v2/https");
 const logger = require("firebase-functions/logger");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
-const {initializeApp} = require("firebase-admin/app");
-const {getFirestore} = require("firebase-admin/firestore");
+const { initializeApp } = require("firebase-admin/app");
+const { getFirestore } = require("firebase-admin/firestore");
 
 initializeApp();
 
@@ -25,9 +25,7 @@ const config = {
 exports.webhook = onRequest(async (request, response) => {
     if (request.method === "GET") {
         try {
-
             logger.info("Verifying webhook");
-
             const mode = request.query["hub.mode"];
             const token = request.query["hub.verify_token"];
             const challenge = request.query["hub.challenge"];
@@ -57,7 +55,6 @@ exports.webhook = onRequest(async (request, response) => {
 
             // Check the webhook event is from a Page subscription
             if (body.object === 'page') {
-
                 // Iterate over each entry - there may be multiple if batched
                 body.entry.forEach(async function (entry) {
                     // Get the webhook event. entry.messaging is an array, but 
@@ -68,12 +65,11 @@ exports.webhook = onRequest(async (request, response) => {
                     // Save the sender PSID
                     await getFirestore()
                         .collection("users")
-                        .add({id: webhook_event.sender.id});
+                        .add({ id: webhook_event.sender.id });
                 });
 
                 // Return a '200 OK' response to all events
                 response.status(200).send('EVENT_RECEIVED');
-
             } else {
                 // Return a '404 Not Found' if event is not from a page subscription
                 response.sendStatus(404);
@@ -86,7 +82,6 @@ exports.webhook = onRequest(async (request, response) => {
 
     }
 });
-
 
 exports.checkAndNotify = onSchedule("* * * * *", async () => {
     checkAndNotify();
@@ -114,8 +109,7 @@ async function checkAndNotify() {
             return null;
         }
 
-        const noTermsMsg = `V najbližšom období nie sú zverejnené ďalšie termíny,
-      v prípade potreby nás prosím kontaktujte.`;
+        const noTermsMsg = 'V najbližšom období nie sú zverejnené ďalšie termíny, v prípade potreby nás prosím kontaktujte.';
 
         const hasNoTerms = termsPageHtml.includes(noTermsMsg);
 

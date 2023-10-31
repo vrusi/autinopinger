@@ -1,128 +1,176 @@
-/**
- * Import function triggers from their respective submodules:
- *
- * const {onCall} = require("firebase-functions/v2/https");
- * const {onDocumentWritten} = require("firebase-functions/v2/firestore");
- *
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
- */
-
-const axios = require("axios");
 const { onRequest } = require("firebase-functions/v2/https");
-const logger = require("firebase-functions/logger");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
-const { initializeApp } = require("firebase-admin/app");
-const { getFirestore } = require("firebase-admin/firestore");
+const admin = require('firebase-admin');
+const axios = require("axios");
+const logger = require("firebase-functions/logger");
+const cheerio = require("cheerio");
 
-initializeApp();
+admin.initializeApp();
+
+const firestore = admin.firestore();
+const schedulesCollection = firestore.collection("schedules");
 
 const config = {
-    VERIFY_TOKEN: "VERIFY_TOKEN",
+    VERIFY_TOKEN: 'VERIFY_TOKEN',
     PAGE_ACCESS_TOKEN: 'PAGE_ACCESS_TOKEN',
     USER_ID: 'USER_ID',
 };
 
+const handleVerification = (request, response) => {
+    try {
+        logger.info("Verifying webhook");
+        const mode = request.query["hub.mode"];
+        const token = request.query["hub.verify_token"];
+        const challenge = request.query["hub.challenge"];
+
+        if (!mode || !token) {
+            logger.error("Webhook not verified: missing mode or token.");
+            response.sendStatus(403);
+        }
+
+        if (mode === "subscribe" && token === config.VERIFY_TOKEN) {
+            logger.info("Webhook verified, sending challenge.");
+            response.status(200).send(challenge);
+
+        } else {
+            logger.error("Webhook not verified: invalid token.");
+            response.sendStatus(403);
+        }
+
+    } catch (error) {
+        logger.error("Error while verifying webhook", error);
+        response.sendStatus(500);
+    }
+}
+
+const handleWebhookEvent = (request, response) => {
+    try {
+        const { body } = request;
+        const { object, entry } = body;
+
+        if (object === 'page') {
+            // Iterate over each entry - there may be multiple if batched
+            entry.forEach(async function (entry) {
+                // Get the webhook event. entry.messaging is an array, but 
+                // will only ever contain one event, so we get index 0
+                const webhookEvent = entry.messaging[0];
+                logger.info(webhookEvent);
+
+                // Save the sender PSID
+                await firestore
+                    .collection("users")
+                    .add({ id: webhookEvent.sender.id });
+            });
+
+            // Return a '200 OK' response to all events
+            response.status(200).send('EVENT_RECEIVED');
+        } else {
+            // Return a '404 Not Found' if event is not from a page subscription
+            response.sendStatus(404);
+        }
+
+    } catch (error) {
+        logger.error("Error while processing webhook event", error);
+        response.sendStatus(500);
+    }
+}
+
 exports.webhook = onRequest(async (request, response) => {
     if (request.method === "GET") {
-        try {
-            logger.info("Verifying webhook");
-            const mode = request.query["hub.mode"];
-            const token = request.query["hub.verify_token"];
-            const challenge = request.query["hub.challenge"];
-
-            // Check if a token and mode is in the query string of the request
-            if (mode && token) {
-                // Check the mode and token sent is correct
-                if (mode === "subscribe" && token === config.VERIFY_TOKEN) {
-                    // Respond with the challenge token from the request
-                    logger.info("Webhook verified");
-                    response.status(200).send(challenge);
-
-                } else {
-                    // Respond with "403 Forbidden" if verify tokens do not match
-                    logger.info("Webhook not verified: invalid token");
-                    response.sendStatus(403);
-                }
-            }
-        } catch (error) {
-            logger.error("Error while verifying webhook", error);
-            response.sendStatus(500);
-        }
+        handleVerification(request, response);
     } else if (request.method === "POST") {
-        try {
-            // Parse the request body from the POST
-            const body = request.body;
-
-            // Check the webhook event is from a Page subscription
-            if (body.object === 'page') {
-                // Iterate over each entry - there may be multiple if batched
-                body.entry.forEach(async function (entry) {
-                    // Get the webhook event. entry.messaging is an array, but 
-                    // will only ever contain one event, so we get index 0
-                    const webhook_event = entry.messaging[0];
-                    logger.info(webhook_event);
-
-                    // Save the sender PSID
-                    await getFirestore()
-                        .collection("users")
-                        .add({ id: webhook_event.sender.id });
-                });
-
-                // Return a '200 OK' response to all events
-                response.status(200).send('EVENT_RECEIVED');
-            } else {
-                // Return a '404 Not Found' if event is not from a page subscription
-                response.sendStatus(404);
-            }
-
-        } catch (error) {
-            logger.error("Error while processing webhook event", error);
-            response.sendStatus(500);
-        }
-
+        handleWebhookEvent(request, response);
     }
 });
 
-exports.checkAndNotify = onSchedule("* * * * *", async () => {
-    checkAndNotify();
-});
-
-/** Gets the HTML Page of the available driving lessons terms */
-async function getTermsPage() {
+async function fetchData() {
     try {
         const response = await axios.get("https://www.rezervujsi.sk/autino");
-        logger.info("Received terms page");
-        return response.data;
+        const data = response.data;
+        const scheduleData = [];
+        const hasScheduleList = data.includes(`<div class="shedule-day">`);
+
+        if (!hasScheduleList) {
+            await firestore.recursiveDelete(schedulesCollection);
+            return scheduleData;
+        }
+
+        const $ = cheerio.load(data);
+
+        const cleanText = (text) => {
+            return text.replaceAll('\n', '').replaceAll('\t', '');
+        }
+
+        const parseTime = (timeString) => {
+            try {
+                const startTime = timeString.slice(0, 5);
+                const endTime = timeString.slice(5);
+                return `${startTime} - ${endTime}`;
+            } catch {
+                return timeString;
+            }
+        }
+
+        $(".shedule-day").each((index, dayElement) => {
+            const date = cleanText($(dayElement).find(".shedule-day-title").text());
+
+            $(dayElement).find(".shedule-item ").each((index, element) => {
+                const link = `https://www.rezervujsi.sk${$(element).find(".shedule-item-a").attr("href")}`;
+                const time = parseTime(cleanText($(element).find(".shedule-item-date span").text()));
+                const instructor = cleanText($(element).find(".shedule-item-title").text());
+                scheduleData.push({
+                    date,
+                    time,
+                    link,
+                    instructor,
+                    id: (date + time + instructor).replaceAll(' ', ''),
+                });
+            });
+        });
+
+        const snapshot = await schedulesCollection.get();
+
+        const lastFetchedScheduleIds = snapshot.empty ? [] : snapshot.docs.map(doc => doc.id);
+        const newSchedules = scheduleData.filter(schedule => !lastFetchedScheduleIds.includes(schedule.id));
+
+        await firestore.recursiveDelete(schedulesCollection);
+
+        scheduleData.forEach(async (schedule) => {
+            await schedulesCollection.doc(schedule.id).set(schedule);
+        });
+
+        return newSchedules;
 
     } catch (error) {
-        logger.error("Error while getting terms page", error);
-        return null;
+        logger.error("Error while fetching data", error);
     }
 }
 
 /** Checks whether there are any terms and notifies */
 async function checkAndNotify() {
     try {
-        const termsPageHtml = await getTermsPage();
+        const newSchedules = await fetchData();
 
-        if (!termsPageHtml) {
-            return null;
-        }
-
-        const noTermsMsg = 'V najbližšom období nie sú zverejnené ďalšie termíny, v prípade potreby nás prosím kontaktujte.';
-
-        const hasNoTerms = termsPageHtml.includes(noTermsMsg);
-
-        if (hasNoTerms) {
+        if (!newSchedules || !newSchedules.length) {
             return;
         }
+
+        const messageTitle = "Nove terminy su dostupne:"
+
+        const messageSchedules = newSchedules.map((schedule) => {
+            return `${schedule.date}\n${schedule.time}\n${schedule.instructor}\n${schedule.link}`;
+        }).join('\n\n');
+
+        const messageFooter = "https://www.rezervujsi.sk/autino"
+
+        const message = `${messageTitle}\n\n${messageSchedules}\n\n${messageFooter}`
 
         const data = {
             "recipient": {
                 "id": config.USER_ID,
             },
             "message": {
-                "text": "Nove terminy su dostupne: https://www.rezervujsi.sk/autino"
+                "text": message
             }
         };
 
@@ -158,3 +206,6 @@ async function checkAndNotify() {
     }
 }
 
+exports.checkAndNotify = onSchedule("* * * * *", async () => {
+    checkAndNotify();
+});
